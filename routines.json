@@ -1,0 +1,34 @@
+{
+  "good morning": [
+    {
+      "tool": "say",
+      "args": {
+        "text": "Good morning."
+      }
+    },
+    {
+      "tool": "weather",
+      "args": {}
+    },
+    {
+      "tool": "open_app",
+      "args": {
+        "app": "chrome"
+      }
+    }
+  ],
+  "work mode": [
+    {
+      "tool": "open_app",
+      "args": {
+        "app": "chrome"
+      }
+    },
+    {
+      "tool": "open_app",
+      "args": {
+        "app": "notepad"
+      }
+    }
+  ]
+}
