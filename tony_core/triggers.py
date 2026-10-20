@@ -10,23 +10,26 @@
 # This module owns its own microphone stream, independent of ears.py,
 # so both listeners can run side by side.
 #
+# MIC BACKENDS: pyaudio first -- probes candidates in order (CLAP_DEVICE,
+# system default input, every input device) and keeps the FIRST that opens,
+# at 16 kHz mono (device default rate as fallback). Then sounddevice
+# (name-matched, MME -> WASAPI -> DirectSound; WDM-KS last, it does not
+# support blocking reads). If nothing opens, retries every 30 seconds.
+#
 # INTEGRATION (app.py):
 #     from tony_core import triggers
-#     triggers.init(speak=say)        # pass tony's speak function
+#     triggers.init(speak=speech.speak, is_speaking=..., mic_index=ears.MIC_DEVICE_INDEX)
 #     triggers.start()                # arm the clap listener
 #     triggers.stop()                 # at shutdown
 #     triggers.is_privileged()        # True while privileged mode is on
 #     triggers.touch()                # call once per user turn (idle timer)
 #
-# INTEGRATION (tools/__init__.py):
-#     from tony_core.triggers import get_secret
-#     TOOLS["get_secret"] = get_secret
-#
 # .ENV OPTIONS:
 #     CLAP_ENABLED=1                  # 0 disables the listener
 #     CLAP_SENSITIVITY=0.6            # 0.1 (strict) - 1.0 (hair trigger)
 #     PRIVILEGED_IDLE_MINUTES=15      # auto stand-down timeout
-#     CLAP_DEVICE=                    # optional input device index
+#     CLAP_DEVICE=                    # optional: device index or name substring
+#                                     # (e.g. CLAP_DEVICE=1 or CLAP_DEVICE=Realtek)
 #
 # SELF-TEST (run alone, tune CLAP_SENSITIVITY):
 #     python -m tony_core.triggers
@@ -50,6 +53,7 @@ _STATE = {
     "last_activity": None,
     "suppress_until": 0.0,   # monotonic time: ignore claps (TTS echo guard)
     "running": False,
+    "debug": False,
 }
 
 _SPEAK = None        # speak callback injected by app.py
@@ -238,19 +242,152 @@ def _rms(pcm_bytes):
 # Microphone stream (own stream, independent of ears.py)
 # ---------------------------------------------------------------------
 
+def _pa_find_by_name(p, name):
+    """Find a PyAudio input device index by name substring."""
+    low = name.lower()
+    for i in range(p.get_device_count()):
+        try:
+            info = p.get_device_info_by_index(i)
+            if info.get("maxInputChannels", 0) > 0 and low in str(info.get("name", "")).lower():
+                return i
+        except Exception:
+            continue
+    return p.get_default_input_device_info()["index"]
+
+
+def _pa_candidates(p):
+    """PyAudio device indices to try, best first: CLAP_DEVICE, system
+    default input, ears.py's mic, then every other input device."""
+    order = []
+    env_dev = _cfg("CLAP_DEVICE", "")
+    if env_dev not in (None, ""):
+        try:
+            if str(env_dev).lstrip("-").isdigit():
+                order.append(int(env_dev))
+            else:
+                order.append(int(_pa_find_by_name(p, str(env_dev))))
+        except Exception:
+            pass
+    try:
+        order.append(int(p.get_default_input_device_info()["index"]))
+    except Exception:
+        pass
+    if _MIC_INDEX not in (None, ""):
+        try:
+            order.append(int(_MIC_INDEX))
+        except (TypeError, ValueError):
+            pass
+    try:
+        for i in range(p.get_device_count()):
+            try:
+                if p.get_device_info_by_index(i).get("maxInputChannels", 0) > 0:
+                    order.append(i)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    seen, out = set(), []
+    for i in order:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def _wanted_mic_names():
+    """Names of the physical mic we should prefer (for sounddevice)."""
+    names = []
+    env_dev = _cfg("CLAP_DEVICE", "")
+    if env_dev not in (None, "") and not str(env_dev).lstrip("-").isdigit():
+        names.append(str(env_dev))
+    if _MIC_INDEX not in (None, ""):
+        try:
+            import pyaudio
+            p = pyaudio.PyAudio()
+            info = p.get_device_info_by_index(int(_MIC_INDEX))
+            names.append(str(info.get("name", "")))
+            p.terminate()
+        except Exception:
+            pass
+    return [n for n in names if n]
+
+
+def _sd_candidates(sd):
+    """sounddevice input device indices to try: name-matched mics first,
+    then MME, WASAPI, DirectSound; WDM-KS dead last (it rejects blocking
+    reads with 'Blocking API not supported yet')."""
+    wanted = [w.lower() for w in _wanted_mic_names()]
+    try:
+        apis = [str(h["name"]).lower() for h in sd.query_hostapis()]
+    except Exception:
+        apis = []
+    named, mme, was, ds, rest = [], [], [], [], []
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            api = d.get("hostapi")
+            api_name = apis[api] if isinstance(api, int) and api < len(apis) else ""
+            name = str(d.get("name", "")).lower()
+            if any(w in name for w in wanted) and "wdm" not in api_name:
+                named.append(i)
+            elif "mme" in api_name:
+                mme.append(i)
+            elif "wasapi" in api_name:
+                was.append(i)
+            elif "directsound" in api_name:
+                ds.append(i)
+            else:
+                rest.append(i)
+    except Exception:
+        pass
+    out = named + mme + was + ds + rest
+    seen, uniq = set(), []
+    for i in out:
+        if i not in seen:
+            seen.add(i)
+            uniq.append(i)
+    return uniq
+
+
 def _open_stream():
-    """Return (read_fn, block, rate, close_fn). Tries pyaudio, then sounddevice."""
+    """Return (read_fn, block, rate, close_fn). Tries pyaudio (probing every
+    candidate device until one opens), then sounddevice."""
     errors = []
     # --- backend 1: pyaudio (tony already ships with it for speech input) ---
     try:
         import pyaudio
         p = pyaudio.PyAudio()
-        idx = _MIC_INDEX if _MIC_INDEX not in (None, "") else _cfg("CLAP_DEVICE", "")
-        idx = p.get_default_input_device_info()["index"] if idx in (None, "") else int(idx)
-        rate = int(p.get_device_info_by_index(idx)["defaultSampleRate"]) or 16000
-        block = max(256, int(rate * 0.032))
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=rate, input=True,
-                        frames_per_buffer=block, input_device_index=idx)
+        stream = None
+        rate = block = 0
+        last_err = None
+        for idx in _pa_candidates(p):
+            name = "?"
+            try:
+                name = str(p.get_device_info_by_index(idx).get("name", "?"))
+            except Exception:
+                pass
+            for try_rate in (16000, 0):     # 0 = device default rate
+                try:
+                    r = try_rate or int(p.get_device_info_by_index(idx)["defaultSampleRate"]) or 16000
+                    b = max(256, int(r * 0.032))
+                    stream = p.open(format=pyaudio.paInt16, channels=1, rate=int(r),
+                                    input=True, frames_per_buffer=b,
+                                    input_device_index=idx)
+                    rate, block = int(r), b
+                    _log("clap mic: using device {0} ({1}) @ {2}Hz".format(idx, name, rate))
+                    break
+                except Exception as e:
+                    last_err = e
+            if stream is not None:
+                break
+            _log("clap mic: device {0} ({1}) refused: {2}".format(idx, name, str(last_err)[:90]))
+        if stream is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            raise RuntimeError("no input device would open (last: {0})".format(last_err))
 
         def read():
             return stream.read(block, exception_on_overflow=False)
@@ -265,21 +402,25 @@ def _open_stream():
         errors.append("pyaudio missing")
     except Exception as e:
         errors.append("pyaudio: {0}".format(e))
-    # --- backend 2: sounddevice ---
+    # --- backend 2: sounddevice (candidate list, WDM-KS last) ---
     try:
         import sounddevice as sd
-        dev = _MIC_INDEX if _MIC_INDEX not in (None, "") else _cfg("CLAP_DEVICE", "")
-        if dev in (None, ""):
-            dev = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-        dev = int(dev)
-        rate = int(sd.query_devices(dev)["default_samplerate"]) or 16000
-        block = max(256, int(rate * 0.032))
-        stream = sd.InputStream(samplerate=rate, blocksize=block, channels=1,
-                                dtype="int16", device=dev)
-        stream.start()
+        stream = None
+        last_err = None
+        for dev in _sd_candidates(sd):
+            try:
+                stream = sd.InputStream(samplerate=16000, blocksize=512, channels=1,
+                                        dtype="int16", device=dev)
+                stream.start()
+                _log("clap mic: sounddevice device {0} @ 16000Hz".format(dev))
+                break
+            except Exception as e:
+                last_err = e
+        if stream is None:
+            raise RuntimeError("no input device would open (last: {0})".format(last_err))
 
         def read():
-            data, _over = stream.read(block)
+            data, _over = stream.read(512)
             return data.tobytes()
 
         def close():
@@ -288,7 +429,7 @@ def _open_stream():
                 stream.close()
             except Exception:
                 pass
-        return read, block, rate, close
+        return read, 512, 16000, close
     except ImportError:
         errors.append("sounddevice missing")
     except Exception as e:
@@ -344,21 +485,32 @@ def _listen_loop(read, rate, close, debug=False):
 # Lifecycle
 # ---------------------------------------------------------------------
 
+def _bootstrap():
+    """Keep trying to open the mic until it works; a busy device at boot
+    must not kill the trigger for the whole session."""
+    while _STATE["running"]:
+        try:
+            read, block, rate, close = _open_stream()
+        except Exception as e:
+            if not _STATE["running"]:
+                return
+            _log("clap mic unavailable, retrying in 30s: {0}".format(e))
+            time.sleep(30.0)
+            continue
+        _log("clap trigger armed ({0}Hz) - double-clap toggles privileged mode".format(rate))
+        _listen_loop(read, rate, close, debug=_STATE["debug"])
+        return
+
+
 def start(debug=False):
     if _STATE["running"]:
         return
     if str(_cfg("CLAP_ENABLED", "1")).strip().lower() in ("0", "false", "no", "off"):
         _log("clap trigger disabled (CLAP_ENABLED=0)")
         return
-    try:
-        read, block, rate, close = _open_stream()
-    except Exception as e:
-        _log("clap trigger unavailable: {0}".format(e))
-        return
+    _STATE["debug"] = bool(debug)
     _STATE["running"] = True
-    threading.Thread(target=_listen_loop, args=(read, rate, close, debug),
-                     daemon=True).start()
-    _log("clap trigger armed ({0}Hz) - double-clap toggles privileged mode".format(rate))
+    threading.Thread(target=_bootstrap, daemon=True).start()
 
 
 def stop():
@@ -369,5 +521,5 @@ if __name__ == "__main__":
     print("CLAP SELF-TEST - clap twice: expect DOUBLE CLAP -> engage, twice more -> stand down.")
     print("Tune CLAP_SENSITIVITY in .env if spikes are missed (higher) or speech triggers (lower).")
     _STATE["running"] = True
-    _r, _b, _rate, _c = _open_stream()
-    _listen_loop(_r, _rate, _c, debug=True)
+    _STATE["debug"] = True
+    _bootstrap()

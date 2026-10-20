@@ -2,6 +2,11 @@
 # tony_core/safety.py
 # Security gate, path access verification, confirmation checks, action logging.
 #
+# PRIVILEGED MODE (double-clap, see triggers.py):
+#   - confirm() auto-approves everything EXCEPT shutdown/restart questions
+#   - _write_gate() skips the "confirm" level; the "block" level stays a hard wall
+#   - Telegram (remote) turns are NEVER auto-approved, privileged or not
+#
 # SHARED MUTABLE GLOBALS OWNED BY THIS MODULE:
 # - CTX: threading.local context (holds remote flag for Telegram)
 # - TURN: dict tracking actions and failures for the current turn
@@ -15,6 +20,7 @@ import time
 import datetime
 import threading
 from tony_core import config
+from tony_core import triggers
 
 CTX = threading.local()
 TURN = {"actions": [], "failures": [], "msg": ""}
@@ -35,8 +41,14 @@ def log_action(name, args, note=""):
 
 _YES = {"yes", "yeah", "yep", "yup", "sure", "confirm", "proceed", "okay", "ok", "affirmative", "y"}
 
+_POWER_WORDS = ("shut down", "shutdown", "restart", "reboot")
+
 def confirm(question: str) -> bool:
     if _remote(): return False
+    if triggers.is_privileged():
+        low = (question or "").lower()
+        if not any(w in low for w in _POWER_WORDS):
+            return True
     print(f"  [CONFIRM] {question}")
     try:
         from tony_core.speech import speak
@@ -80,10 +92,15 @@ def _write_gate(p):
     v = _path_verdict(p)
     if v == "block":
         return "Blocked: that location is protected. Tell the user plainly; do NOT try another route."
-    if v == "confirm" and time.time() - APPROVED.get(_normpath(p), 0) > 600:
-        if not confirm(f"write {os.path.basename(p)} into {os.path.dirname(p)}?"):
-            return "The user did not approve that write. It was cancelled; do NOT retry."
-        APPROVED[_normpath(p)] = time.time()
+    if v == "confirm":
+        if triggers.is_privileged() and not _remote():
+            APPROVED[_normpath(p)] = time.time()
+            log_action("write_gate", {"path": str(p)}, "[privileged auto-approve]")
+            return None
+        if time.time() - APPROVED.get(_normpath(p), 0) > 600:
+            if not confirm(f"write {os.path.basename(p)} into {os.path.dirname(p)}?"):
+                return "The user did not approve that write. It was cancelled; do NOT retry."
+            APPROVED[_normpath(p)] = time.time()
     return None
 
 READONLY_CMD = re.compile(r"^\s*(dir|echo|ipconfig|whoami|hostname|ver|tasklist|systeminfo|where|"

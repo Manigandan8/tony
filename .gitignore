@@ -1,45 +1,30 @@
-# =====================================================================
-# Tony Voice Assistant — Git Ignore Configuration
-# =====================================================================
-
-# Environment & Sensitive Credentials (NEVER COMMIT)
+# Secrets & Credentials
 .env
-*.env
-*.env.*
-!.env.example
+*.pem
+*.key
 
-# Python Virtual Environments & Packages
-venv/
-.venv/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-
-# Tony Runtime State, Logs & Generated Audio
-tony_actions.log
-*.log
+# Tony Personal Memory, Logs, Settings & Databases (NEVER PUSH TO GITHUB)
 tony_memory.json
 tony_facts.json
 tony_settings.json
+tony_actions.log
+*.log
+*.db
+*.db-wal
+*.db-shm
 tony_cache/
-*.mp3
-*.wav
 
-# Backup files
-*.bak
-*.bak_*
-*.tmp
+# Personal/Scratch Folders & Legacy Scripts
+backup/
+mukesh/
+Desktop/
+tony1.py
+fix.py
+zaitest.py
+snake_game.py
 
-# Editor & OS Artifacts
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+# Python & OS
+__pycache__/
+*.py[cod]
+venv/
+.venv/
