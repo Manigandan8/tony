@@ -1,7 +1,12 @@
 # Secrets & Credentials
 .env
+.env.*
+!.env.example
 *.pem
 *.key
+credentials*.json
+token*.json
+client_secret*.json
 
 # Tony Personal Memory, Logs, Settings & Databases (NEVER PUSH TO GITHUB)
 tony_memory.json
@@ -13,6 +18,15 @@ tony_actions.log
 *.db-wal
 *.db-shm
 tony_cache/
+
+# Audio & Media Cache
+*.mp3
+*.wav
+
+# Backups & Scratch
+*.bak*
+*.swp
+*~
 
 # Personal/Scratch Folders & Legacy Scripts
 backup/
@@ -28,3 +42,5 @@ __pycache__/
 *.py[cod]
 venv/
 .venv/
+.DS_Store
+Thumbs.db

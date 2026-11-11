@@ -1,9 +1,9 @@
 {
-  "good morning": [
+  "morning": [
     {
-      "tool": "say",
+      "tool": "open_app",
       "args": {
-        "text": "Good morning."
+        "app": "chrome"
       }
     },
     {
@@ -11,17 +11,15 @@
       "args": {}
     },
     {
-      "tool": "open_app",
-      "args": {
-        "app": "chrome"
-      }
+      "tool": "system_status",
+      "args": {}
     }
   ],
-  "work mode": [
+  "focus": [
     {
-      "tool": "open_app",
+      "tool": "set_volume",
       "args": {
-        "app": "chrome"
+        "level": 25
       }
     },
     {

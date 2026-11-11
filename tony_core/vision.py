@@ -1,17 +1,7 @@
 # =====================================================================
 # tony_core/vision.py
-# Vision processing: screenshot capture, VLM provider fallback chain,
+# Vision processing: 0ms screen_pulse frame grab, VLM fallback chain,
 # Set-of-Mark (SoM) visual grounding, column-aware OCR & UIA locator.
-#
-# SHARED MUTABLE GLOBALS REFERENCED AND MUTATED ACROSS PROVIDERS:
-# - groqai.GROQ_VISION_MODEL (rebound on 404/retirement)
-# - github_models.GITHUB_VISION_MODELS (reordered / items removed)
-# - zai.ZAI_VISION_MODELS (reordered / items removed)
-# - zai._ZAI_VISION_WAIT (cooldown timestamp)
-# - mistralai.MISTRAL_VISION_MODELS (reordered / items removed)
-# - gemini.GEMINI_VISION_MODELS (reordered / items removed)
-# - cohereai.COHERE_VISION_MODELS (reordered / items removed)
-# - openrouter.OR_VISION_MODELS (reordered / items removed)
 # =====================================================================
 
 import os
@@ -26,6 +16,7 @@ import platform
 from google.genai import types as gemini_types
 
 from tony_core import config
+from tony_core import screen_pulse
 from tony_core.net import HTTP
 from tony_core.providers import groqai, github_models, zai, mistralai, gemini, cohereai, openrouter
 
@@ -55,15 +46,8 @@ _GENERIC_STOPWORDS = {
 
 
 def _screenshot_image():
-    from PIL import Image
-    try:
-        import mss
-        with mss.mss() as sct:
-            raw_sct = sct.grab(sct.monitors[1])
-            img = Image.frombytes("RGB", raw_sct.size, raw_sct.bgra, "raw", "BGRX")
-    except Exception:
-        from PIL import ImageGrab
-        img = ImageGrab.grab()
+    """Grabs the pre-captured 1-second frame from screen_pulse (0ms delay!)."""
+    img = screen_pulse.get_latest_frame()
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return img, buf.getvalue()
@@ -101,17 +85,25 @@ def _active_region(img):
     return None
 
 
-def _is_in_browser_top_chrome(y: int, screen_h: int) -> bool:
-    """Rejects hits inside browser tabs, URL bar, YouTube search bar, and category chips."""
-    return y < int(screen_h * 0.18)
+def _is_excluded_zone(x: int, y: int, screen_h: int) -> bool:
+    if y < int(screen_h * 0.18):
+        return True
+    if x < 340 and y < 150:
+        return True
+    return False
+
+
+def _scale_vlm_coords(rx: float, ry: float, w: int, h: int, scale: float, grid_1000: bool = False):
+    if rx <= 1.0 and ry <= 1.0:
+        px, py = int(rx * w), int(ry * h)
+    elif grid_1000 and 0 <= rx <= 1000 and 0 <= ry <= 1000:
+        px, py = int((rx / 1000.0) * w), int((ry / 1000.0) * h)
+    else:
+        px, py = int(rx * scale), int(ry * scale)
+    return max(0, min(px, w - 1)), max(0, min(py, h - 1))
 
 
 def _split_ocr_into_phrases(data, min_conf=42):
-    """
-    Groups OCR words into lines, then splits any line where consecutive words have
-    a horizontal gap > 28px. This prevents side-by-side YouTube video columns from
-    merging into a single wide bounding box whose midpoint lands in empty space!
-    """
     raw_lines = {}
     for i, raw in enumerate(data["text"]):
         wd = (raw or "").strip()
@@ -129,9 +121,7 @@ def _split_ocr_into_phrases(data, min_conf=42):
         for idx in idxs_sorted[1:]:
             prev = curr[-1]
             prev_right = data["left"][prev] + data["width"][prev]
-            gap = data["left"][idx] - prev_right
-            # If gap > 28px, it belongs to a different column/video card!
-            if gap > 28:
+            if data["left"][idx] - prev_right > 28:
                 phrases.append(curr)
                 curr = [idx]
             else:
@@ -142,17 +132,13 @@ def _split_ocr_into_phrases(data, min_conf=42):
 
 
 def _safe_click_point(l: int, t: int, r: int, b: int):
-    """
-    Returns a click point on the left-third of a text phrase rather than dead center,
-    avoiding empty trailing space or 3-dot menu icons on YouTube cards.
-    """
     width = max(1, r - l)
     cx = l + min(75, max(12, width // 3))
     cy = (t + b) // 2
     return cx, cy
 
 
-def _match_ocr(data, want, offset_y=0, screen_h=1080):
+def _match_ocr(data, want, offset_x=0, offset_y=0, screen_h=1080):
     want_clean = re.sub(r"\s+", " ", (want or "").lower().strip())
     if not want_clean or _ORDINAL_OR_VISUAL_PAT.search(want_clean):
         return None
@@ -166,23 +152,22 @@ def _match_ocr(data, want, offset_y=0, screen_h=1080):
     best = None
 
     for idxs in phrases:
+        l_min = min(data["left"][i] for i in idxs) + offset_x
         t_min = min(data["top"][i] for i in idxs) + offset_y
         b_max = max(data["top"][i] + data["height"][i] for i in idxs) + offset_y
         cy = (t_min + b_max) // 2
-        if _is_in_browser_top_chrome(cy, screen_h):
+        if _is_excluded_zone(l_min, cy, screen_h):
             continue
 
         words = [data["text"][i].strip().lower().strip(".,:;!?()[]{}'\"") for i in idxs]
         phrase_str = " ".join(words)
         hit, score = None, 0.0
 
-        # 1) Exact phrase match
         for s in range(len(words) - len(sig) + 1):
             if words[s:s + len(sig)] == sig:
                 hit, score = idxs[s:s + len(sig)], 260.0
                 break
 
-        # 2) Multi-word phonetic / fuzzy match (handles Whisper misspellings like "Dola Yei" -> "Dola Re")
         if hit is None:
             matched_idxs = []
             exact_hits = 0
@@ -204,7 +189,6 @@ def _match_ocr(data, want, offset_y=0, screen_h=1080):
                 hit = matched_idxs
                 score = 170.0 + (len(matched_idxs) / len(sig)) * 40.0
             elif len(sig) >= 2 and exact_hits >= 1 and len(sig[0]) >= 4:
-                # Anchor word (e.g. "dola") matched strongly even if 2nd word ("yei") was Whisper noise
                 whole_ratio = difflib.SequenceMatcher(None, " ".join(sig), phrase_str).ratio()
                 if whole_ratio >= 0.52 or any(w == sig[0] for w in words):
                     hit = idxs
@@ -242,7 +226,7 @@ def _ocr_find_xy(text_to_find: str, img):
             crop = img.crop(region) if region else img
             ox, oy = (region[0], region[1]) if region else (0, 0)
             data = pytesseract.image_to_data(crop.convert("L"), output_type=pytesseract.Output.DICT)
-            hit = _match_ocr(data, text_to_find, offset_y=oy, screen_h=img.height)
+            hit = _match_ocr(data, text_to_find, offset_x=ox, offset_y=oy, screen_h=img.height)
             if hit:
                 print(f"  [vision answered by: local OCR ('{hit[2]}')]")
                 return hit[0] + ox, hit[1] + oy, hit[2]
@@ -255,7 +239,6 @@ def _vision_describe(raw: bytes, instruction: str) -> str:
     deadline = time.time() + VISION_BUDGET_S
     b64 = base64.b64encode(raw).decode()
 
-    # 1) Try Gemini first (fastest & most reliable for Set-of-Mark visual grounding)
     if gemini.client:
         for gm in list(gemini.GEMINI_VISION_MODELS):
             if time.time() > deadline:
@@ -276,14 +259,12 @@ def _vision_describe(raw: bytes, instruction: str) -> str:
                     if gm in gemini.GEMINI_VISION_MODELS:
                         gemini.GEMINI_VISION_MODELS.remove(gm)
                 elif "503" in msg or "UNAVAILABLE" in msg or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-                    # Demote overloaded model to back of queue so next call doesn't stall on it
                     if gm in gemini.GEMINI_VISION_MODELS and len(gemini.GEMINI_VISION_MODELS) > 1:
                         gemini.GEMINI_VISION_MODELS.append(gemini.GEMINI_VISION_MODELS.pop(gemini.GEMINI_VISION_MODELS.index(gm)))
                     print(f"  [{gm}: busy/overloaded — switching to next]")
                 else:
                     print(f"  [{gm}: failed: {msg[:50]}]")
 
-    # 2) Groq Vision (if configured)
     if groqai.GROQ_VISION_MODEL:
         try:
             r = groqai.groq.chat.completions.create(
@@ -303,7 +284,6 @@ def _vision_describe(raw: bytes, instruction: str) -> str:
             else:
                 print(f"  [groq vision failed: {msg[:50]}]")
 
-    # 3) GitHub Models Vision
     if config.GITHUB_TOKEN and github_models.GITHUB_VISION_MODELS:
         for gvm in list(github_models.GITHUB_VISION_MODELS):
             if time.time() > deadline:
@@ -329,7 +309,6 @@ def _vision_describe(raw: bytes, instruction: str) -> str:
             except Exception:
                 continue
 
-    # 4) Z.ai Vision (with shorter 10s timeout so overloaded 429s never stall Tony)
     if zai.ZAI_API_KEY and zai.ZAI_VISION_MODELS and time.time() >= zai._ZAI_VISION_WAIT["until"]:
         for zvm in list(zai.ZAI_VISION_MODELS):
             if time.time() > deadline:
@@ -353,7 +332,6 @@ def _vision_describe(raw: bytes, instruction: str) -> str:
             except Exception:
                 break
 
-    # 5) Mistral / Cohere / OpenRouter Vision fallbacks
     if config.MISTRAL_API_KEY and mistralai.MISTRAL_VISION_MODELS:
         for mvm in list(mistralai.MISTRAL_VISION_MODELS):
             if time.time() > deadline:
@@ -423,20 +401,15 @@ def _screenshot_text(instruction: str) -> str:
 
 
 def _collect_som_candidates(img):
-    """
-    Gathers clickable candidate regions from UIA + column-split OCR phrases.
-    Never merges side-by-side YouTube columns into one wide box!
-    """
     w, h = img.size
     candidates = []
     seen_points = []
 
     def _add_cand(name, l, t, r, b, kind="UI"):
         if (r - l) > int(w * 0.48):
-            # Reject overly wide multi-column spans
             return
         cx, cy = _safe_click_point(l, t, r, b)
-        if _is_in_browser_top_chrome(cy, h):
+        if _is_excluded_zone(cx, cy, h):
             return
         if cx < 10 or cy < 10 or cx >= w - 10 or cy >= h - 10:
             return
@@ -452,12 +425,12 @@ def _collect_som_candidates(img):
             "center": (cx, cy)
         })
 
-    # 1) Try Windows UIA interactive elements
     try:
         from pywinauto import Desktop
         top_win = Desktop(backend="uia").top_window()
+        uia_deadline = time.time() + 1.5
         for ctrl in top_win.descendants():
-            if len(candidates) >= 40:
+            if len(candidates) >= 40 or time.time() > uia_deadline:
                 break
             try:
                 ct = ctrl.element_info.control_type
@@ -478,7 +451,6 @@ def _collect_som_candidates(img):
     except Exception:
         pass
 
-    # 2) Supplement with column-split OCR phrases
     if len(candidates) < 15 and OCR_ENABLED:
         try:
             import pytesseract
@@ -503,9 +475,6 @@ def _collect_som_candidates(img):
 
 
 def _som_locate(element: str, img=None):
-    """
-    Set-of-Mark (SoM) Visual Grounding with column-split bounding boxes.
-    """
     from PIL import ImageDraw
     if img is None:
         img, _ = _screenshot_image()
@@ -541,13 +510,13 @@ def _som_locate(element: str, img=None):
     catalog_text = "\n".join(catalog_lines)
 
     prompt = (
-        f"This is a {sw}x{sh} screenshot annotated with numbered red boxes [1], [2], [3], etc.\n"
-        f"The user wants to click: '{element}' (note: speech recognition may have slightly misspelled foreign/song words).\n"
+        f"This screenshot is annotated with numbered red boxes [1], [2], [3], etc.\n"
+        f"The user wants to click: '{element}'.\n"
         f"Candidate labels detected on screen:\n{catalog_text}\n\n"
         f"If a numbered red box [id] is on the target video title, thumbnail, or button, reply ONLY with JSON:\n"
         f'{{"found": true, "id": <int>, "what": "<exact title>"}}\n'
-        f"Or if you see the target video thumbnail/title better directly, return the pixel center of the VIDEO THUMBNAIL in the {sw}x{sh} image:\n"
-        f'{{"found": true, "x": <int>, "y": <int>, "what": "<exact title>"}}\n'
+        f"Or if the target is not in a red box, return normalized 0..1000 coordinates (0,0 = top-left, 1000,1000 = bottom-right):\n"
+        f'{{"found": true, "x": <0..1000>, "y": <0..1000>, "what": "<exact title>"}}\n'
         f'Or {{"found": false}} if not visible.'
     )
 
@@ -566,10 +535,8 @@ def _som_locate(element: str, img=None):
             print(f"  [SoM locate: picked badge [{j['id']}] '{label}' @ ({cx},{cy})]")
             return cx, cy, label
         if isinstance(j.get("x"), (int, float)) and isinstance(j.get("y"), (int, float)):
-            rx, ry = float(j["x"]), float(j["y"])
-            px, py = (int(rx * w), int(ry * h)) if (rx <= 1.0 and ry <= 1.0) else (int(rx * scale), int(ry * scale))
-            px, py = max(0, min(px, w - 1)), max(0, min(py, h - 1))
-            if not _is_in_browser_top_chrome(py, h):
+            px, py = _scale_vlm_coords(float(j["x"]), float(j["y"]), w, h, scale, grid_1000=True)
+            if not _is_excluded_zone(px, py, h):
                 return px, py, (j.get("what") or element).strip()
     except Exception:
         pass
@@ -583,12 +550,11 @@ def _find_element_xy(element: str):
         return som_hit
 
     w, h = img.size
-    sw, sh = int(w / scale), int(h / scale)
     prompt = (
-        f"This is a {sw}x{sh} Windows screenshot. Locate the clickable video thumbnail or title link for: '{element}'. "
+        f"Locate the clickable video thumbnail or UI element for: '{element}'. "
         f"Ignore the small 'Tony' overlay window in the top-left corner and NEVER click the top search bar. "
-        f"Return ONLY a valid JSON object with pixel coordinates of the center of the video thumbnail in the {sw}x{sh} image: "
-        f'{{"found": true, "x": <int>, "y": <int>, "what": "<short description>"}} '
+        f"Return ONLY valid JSON with normalized 0..1000 coordinates (0,0 = top-left, 1000,1000 = bottom-right): "
+        f'{{"found": true, "x": <0..1000>, "y": <0..1000>, "what": "<short description>"}} '
         f'or {{"found": false}} if not visible.'
     )
     txt = _vision_describe(raw, prompt)
@@ -597,9 +563,9 @@ def _find_element_xy(element: str):
         try:
             j = json.loads(m.group(0))
             if j.get("found") and isinstance(j.get("x"), (int, float)) and isinstance(j.get("y"), (int, float)):
-                rx, ry = float(j["x"]), float(j["y"])
-                px, py = (int(rx * w), int(ry * h)) if (rx <= 1.0 and ry <= 1.0) else (int(rx * scale), int(ry * scale))
-                return (max(0, min(px, w - 1)), max(0, min(py, h - 1)), j.get("what", element))
+                px, py = _scale_vlm_coords(float(j["x"]), float(j["y"]), w, h, scale, grid_1000=True)
+                if not _is_excluded_zone(px, py, h):
+                    return (px, py, j.get("what", element))
         except Exception:
             pass
     return _ocr_find_xy(element, img)
